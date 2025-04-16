@@ -23,13 +23,24 @@ st.title("🗺️ Postcode 4 Dashboard Nederland")
 st.markdown("Dashboard voor visualisatie van gegevens op PC4-niveau in Nederland.")
 
 # Sidebar voor bestandsupload
-st.sidebar.title("Bestandsupload")
+st.sidebar.title("Data bronnen")
 
+# Controleer of de shapefile bestanden lokaal beschikbaar zijn
+shapefile_path = "data/PC4.shp"
+has_local_shapefile = os.path.exists(shapefile_path)
+
+# Alleen Excel bestand is nodig voor upload (andere bestanden zijn in repository)
 uploaded_excel = st.sidebar.file_uploader("Upload het Excel bestand (PC4 verrijkt)", type=['xlsx'])
-uploaded_shapefile = st.sidebar.file_uploader("Upload het Shapefile (.shp)", type=['shp'])
-uploaded_shx = st.sidebar.file_uploader("Upload het SHX bestand (.shx)", type=['shx'])
-uploaded_dbf = st.sidebar.file_uploader("Upload het DBF bestand (.dbf)", type=['dbf'])
-uploaded_prj = st.sidebar.file_uploader("Upload het PRJ bestand (.prj)", type=['prj'], accept_multiple_files=False)
+
+if has_local_shapefile:
+    st.sidebar.success("✅ Shapefile bestanden zijn geladen vanuit de repository")
+else:
+    st.sidebar.warning("⚠️ Shapefile bestanden niet gevonden in repository")
+    # Als de shapefile niet lokaal beschikbaar is, vraag om uploads
+    uploaded_shapefile = st.sidebar.file_uploader("Upload het Shapefile (.shp)", type=['shp'])
+    uploaded_shx = st.sidebar.file_uploader("Upload het SHX bestand (.shx)", type=['shx'])
+    uploaded_dbf = st.sidebar.file_uploader("Upload het DBF bestand (.dbf)", type=['dbf'])
+    uploaded_prj = st.sidebar.file_uploader("Upload het PRJ bestand (.prj)", type=['prj'], accept_multiple_files=False)
 
 # Functie om tijdelijke bestanden aan te maken van uploads
 def save_uploaded_files():
@@ -43,26 +54,29 @@ def save_uploaded_files():
         with open(excel_path, "wb") as f:
             f.write(uploaded_excel.getbuffer())
     
-    # Sla Shapefile bestanden op
-    if uploaded_shapefile is not None:
+    # Als de shapefile lokaal beschikbaar is, gebruik die
+    if has_local_shapefile:
+        shapefile_path = "data/PC4.shp"
+    # Anders gebruik de uploads
+    elif 'uploaded_shapefile' in locals() and uploaded_shapefile is not None:
         shapefile_path = os.path.join(temp_dir, "PC4.shp")
         with open(shapefile_path, "wb") as f:
             f.write(uploaded_shapefile.getbuffer())
             
         # SHX bestand
-        if uploaded_shx is not None:
+        if 'uploaded_shx' in locals() and uploaded_shx is not None:
             shx_path = os.path.join(temp_dir, "PC4.shx")
             with open(shx_path, "wb") as f:
                 f.write(uploaded_shx.getbuffer())
         
         # DBF bestand
-        if uploaded_dbf is not None:
+        if 'uploaded_dbf' in locals() and uploaded_dbf is not None:
             dbf_path = os.path.join(temp_dir, "PC4.dbf")
             with open(dbf_path, "wb") as f:
                 f.write(uploaded_dbf.getbuffer())
         
         # PRJ bestand
-        if uploaded_prj is not None:
+        if 'uploaded_prj' in locals() and uploaded_prj is not None:
             prj_path = os.path.join(temp_dir, "PC4.prj")
             with open(prj_path, "wb") as f:
                 f.write(uploaded_prj.getbuffer())
@@ -217,22 +231,37 @@ def calculate_derived_metrics(data):
     
     return data
 
-# Controleer of alle benodigde bestanden zijn geüpload
-if uploaded_excel is not None and uploaded_shapefile is not None and uploaded_shx is not None and uploaded_dbf is not None:
+# Controleer of de benodigde bestanden beschikbaar zijn
+can_load_data = False
+
+if uploaded_excel is not None:
+    if has_local_shapefile:
+        can_load_data = True
+    elif 'uploaded_shapefile' in locals() and 'uploaded_shx' in locals() and 'uploaded_dbf' in locals() and \
+         uploaded_shapefile is not None and uploaded_shx is not None and uploaded_dbf is not None:
+        can_load_data = True
+
+if can_load_data:
     # Data laden met een spinner om te laten zien dat het bezig is
     with st.spinner('Data wordt geladen...'):
         temp_dir, excel_path, shapefile_path = save_uploaded_files()
         df, netherlands, merged_data = load_data(excel_path, shapefile_path)
 else:
-    # Toon demo mode als bestanden niet zijn geüpload
-    st.info("Upload de benodigde bestanden om de applicatie te gebruiken:")
-    st.markdown("""
-    De volgende bestanden zijn nodig:
-    1. Excel bestand met PC4 gegevens (PC4_verrijkt.xlsx)
-    2. Shapefile met Nederlandse postcodegebieden (PC4.shp)
-    3. Bijbehorende .shx bestand
-    4. Bijbehorende .dbf bestand
-    """)
+    # Toon intro bericht als bestanden niet zijn geüpload
+    st.info("⚠️ Upload het Excel bestand om de applicatie te gebruiken")
+    
+    if not has_local_shapefile:
+        st.markdown("""
+        **Daarnaast heb je deze bestanden nodig:**
+        1. Shapefile met Nederlandse postcodegebieden (PC4.shp)
+        2. Bijbehorende .shx bestand
+        3. Bijbehorende .dbf bestand
+        4. Bijbehorende .prj bestand
+        """)
+    
+    # Demo mode met placeholder afbeelding
+    st.image("https://via.placeholder.com/800x400.png?text=PC4+Dashboard+Demo", 
+             caption="Upload de benodigde bestanden om de interactieve kaart te zien")
     st.stop()
 
 # Controleer of we geldige data hebben ontvangen

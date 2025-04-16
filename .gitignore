@@ -1,3 +1,6 @@
+# Streamlit
+.streamlit/secrets.toml
+
 # Python
 __pycache__/
 *.py[cod]
@@ -21,15 +24,29 @@ wheels/
 .installed.cfg
 *.egg
 
-# Virtual Environment
+# Data bestanden (alleen het Excel bestand met gevoelige data uitsluiten)
+*.xlsx
+*.xls
+*.csv
+
+# Alle bestanden in data directory toestaan
+!data/
+!data/*
+
+# Virtuele omgevingen
 venv/
 ENV/
+env/
+.env/
 
 # VS Code
 .vscode/
-.history/
+.history
 
-# OS specific
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Operating System bestanden
 .DS_Store
 .DS_Store?
 ._*
