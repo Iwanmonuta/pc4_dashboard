@@ -44,6 +44,6 @@ Deze app is gebouwd met:
 - [GeoPandas](https://geopandas.org/)
 - [Plotly](https://plotly.com/)
 
-## Bijdragen
+## Suggesties
 
-Bijdragen zijn welkom! Maak een fork van deze repository en stuur een pull request.
+Suggesties voor verbeteringen zijn welkom.
