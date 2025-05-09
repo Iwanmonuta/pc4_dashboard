@@ -8,7 +8,11 @@ import tempfile
 from pathlib import Path
 import io
 
-# Monuta kleuren palette
+# Aangepaste kleurenschalen
+# Rood naar groen via grijs voor numerieke data
+rood_grijs_groen_palette = ["#ff0000", "#ff4d4d", "#ff9999", "#ffcccc", "#e0e0e0", "#ccffcc", "#99ff99", "#4dff4d", "#00ff00"]
+
+# Behoud de originele Monuta palette voor categorische data
 monuta_palette = ["#3f582d", "#74975d", "#6e0038", "#d87f7e", "#d763a9", "#66b3c9"]
 
 # Configuratie van de pagina
@@ -162,7 +166,7 @@ def load_data(excel_path, shapefile_path):
             df = df.dropna(subset=['woonplaats'])
         
         # Controleer welke kolommen daadwerkelijk bestaan in het dataframe
-        expected_columns = ['provincie', 'gemeente', 'woonplaats', 'cluster', 'voorstel_benaming_uvb', 'voorstel_onderneming']
+        expected_columns = ['provincie', 'gemeente', 'woonplaats', 'cluster', 'voorstel_benaming_uvb', 'voorstel_onderneming', 'voorstel_gebied_cat']
         existing_columns = [col for col in expected_columns if col in df.columns]
         
         # Log welke kolommen ontbreken
@@ -231,6 +235,99 @@ def calculate_derived_metrics(data):
     
     return data
 
+# Nieuwe functie om te aggregeren naar gemeenteniveau
+def aggregate_to_gemeente(data):
+    """
+    Aggregeert data van PC4-niveau naar gemeenteniveau.
+    """
+    if 'gemeente' not in data.columns:
+        st.warning("Gemeente kolom niet gevonden, kan niet aggregeren.")
+        return data
+    
+    # Maak een kopie om de originele data niet te wijzigen
+    data_copy = data.copy()
+    
+    # Aggregeer de numerieke kolommen
+    numeric_columns = [
+        'inwoners', 'inwoners_65plus', 'sterfte_2023', 'uitvaarten_2023', 
+        'uitvaarten_2024', 'uitvaarten_2025', 'aantal_verzekerden',
+        'uitkeringen', 'reistijd_min'
+    ]
+    
+    # Selecteer alleen bestaande kolommen
+    numeric_columns = [col for col in numeric_columns if col in data_copy.columns]
+    
+    # Bereken gemiddelde WOZ-waarde gewogen op inwoners
+    if 'woz' in data_copy.columns and 'inwoners' in data_copy.columns:
+        data_copy['woz_inwoners_product'] = data_copy['woz'] * data_copy['inwoners']
+    
+    # Groeperen op gemeente en aggregeren
+    gemeente_aggs = {}
+    
+    # Voor numerieke kolommen die opgeteld moeten worden
+    for col in numeric_columns:
+        if col in data_copy.columns:
+            gemeente_aggs[col] = 'sum'
+    
+    # Speciale gevallen
+    if 'woz' in data_copy.columns:
+        gemeente_aggs['woz'] = 'mean'  # Standaard gemiddelde
+    
+    if 'woz_inwoners_product' in data_copy.columns:
+        gemeente_aggs['woz_inwoners_product'] = 'sum'
+    
+    if 'reistijd_min' in data_copy.columns:
+        gemeente_aggs['reistijd_min'] = 'mean'  # Gemiddelde reistijd
+        
+    # Als voorstel_gebied_cat bestaat, neem de meest voorkomende waarde
+    if 'voorstel_gebied_cat' in data_copy.columns:
+        # Functie om meest voorkomende waarde te vinden
+        def most_common(series):
+            return series.mode().iloc[0] if not series.mode().empty else "Onbekend"
+        
+        gemeente_aggs['voorstel_gebied_cat'] = most_common
+    
+    # Aggregeer op gemeente
+    gemeente_data = data_copy.groupby('gemeente').agg(gemeente_aggs).reset_index()
+    
+    # Bereken de afgeleide metrics opnieuw
+    if 'sterfte_2023' in gemeente_data.columns and 'uitvaarten_2023' in gemeente_data.columns:
+        gemeente_data['berekend_marktaandeel_2023'] = np.where(
+            gemeente_data['sterfte_2023'] > 0,
+            gemeente_data['uitvaarten_2023'] / gemeente_data['sterfte_2023'] * 100,
+            0
+        )
+    
+    if 'uitkeringen' in gemeente_data.columns and 'inwoners' in gemeente_data.columns:
+        gemeente_data['percentage_uitkeringen'] = np.where(
+            gemeente_data['inwoners'] > 0,
+            gemeente_data['uitkeringen'] / gemeente_data['inwoners'] * 100,
+            0
+        )
+    
+    # Bereken gewogen gemiddelde WOZ indien beschikbaar
+    if 'woz_inwoners_product' in gemeente_data.columns and 'inwoners' in gemeente_data.columns:
+        gemeente_data['woz'] = gemeente_data['woz_inwoners_product'] / gemeente_data['inwoners']
+        gemeente_data = gemeente_data.drop(columns=['woz_inwoners_product'])
+    
+    # Maak een GeoPandas dataframe van het resultaat
+    # Voor visualisatie hebben we geometrie nodig
+    if isinstance(data, gpd.GeoDataFrame):
+        # Lossen geometrie op door het samenvoegen (dissolve) van de PC4-geometrieën per gemeente
+        gemeente_geometries = data.dissolve(by='gemeente')
+        
+        # Samenvoegen van de geaggregeerde data met de geometrieën
+        gemeente_gdf = gpd.GeoDataFrame(
+            gemeente_data.merge(gemeente_geometries.reset_index()[['gemeente', 'geometry']], on='gemeente'),
+            geometry='geometry'
+        )
+        
+        return gemeente_gdf
+    else:
+        # Als het geen GeoDataFrame is, geef een waarschuwing
+        st.warning("Kan geen kaart maken zonder geometrie data.")
+        return gemeente_data
+
 # Controleer of de benodigde bestanden beschikbaar zijn
 can_load_data = False
 
@@ -285,7 +382,7 @@ column_mapping = {
     "WOZ Waarde": "woz",
     "Percentage Uitkeringen": "percentage_uitkeringen",
     "Reistijd (minuten)": "reistijd_min",
-    "Voorstel Gebied Categorie": "voorstel_gebied_cat"  # NIEUW: Voeg de nieuwe kolom toe
+    "Voorstel Gebied Categorie": "voorstel_gebied_cat"  # Nieuwe kolom toegevoegd
 }
 
 # Sidebar-filters
@@ -396,21 +493,47 @@ with organisatie_container:
         if selected_uvbs:
             filtered_data = filtered_data[filtered_data['voorstel_benaming_uvb'].isin(selected_uvbs)]
             
-    # NIEUW: Voorstel gebied cat filter - alleen als kolom bestaat
-    if 'voorstel_gebied_cat' in filtered_data.columns:
-        gebied_cat_values = sorted(filtered_data['voorstel_gebied_cat'].fillna('Onbekend').astype(str).unique().tolist())
-        selected_gebied_cats = st.multiselect(
-            "Filter op voorstel gebied categorie:",
-            gebied_cat_values,
-            default=[]
-        )
-        
-        # Filter op voorstel gebied categorie als er een selectie is gemaakt
-        if selected_gebied_cats:
-            filtered_data = filtered_data[filtered_data['voorstel_gebied_cat'].isin(selected_gebied_cats)]
+    # Voorstel gebied cat filter - robuuste implementatie met verschillende mogelijke kolomnamen
+    gebied_cat_kolommen = [
+        'voorstel_gebied_cat', 
+        'voorstel gebied cat',
+        'Voorstel_gebied_cat',
+        'Voorstel gebied cat',
+        'voorstelGebiedCat',
+        'voorstel_gebied_categorie',
+        'voorstel gebied categorie'
+    ]
+
+    # Zoek welke variant van de kolomnaam in de data bestaat
+    for kolom in gebied_cat_kolommen:
+        if kolom in filtered_data.columns:
+            gebied_cat_kolom = kolom
+            gebied_cat_values = sorted(filtered_data[kolom].fillna('Onbekend').astype(str).unique().tolist())
+            selected_gebied_cats = st.multiselect(
+                "Filter op voorstel gebied categorie:",
+                gebied_cat_values,
+                default=[]
+            )
+            
+            # Filter op voorstel gebied categorie als er een selectie is gemaakt
+            if selected_gebied_cats:
+                filtered_data = filtered_data[filtered_data[kolom].isin(selected_gebied_cats)]
+            
+            # Voeg toe aan column_mapping als het nog niet bestaat
+            if "Voorstel Gebied Categorie" not in [k for k, v in column_mapping.items()]:
+                column_mapping["Voorstel Gebied Categorie"] = kolom
+            
+            break
 
 # Selecteer een kolom voor visualisatie in de statistieken aan rechterkant
 st.sidebar.subheader("Visualisatie opties")
+
+# Selectie van visualisatie niveau
+visualisatie_niveau = st.sidebar.radio(
+    "Visualiseer op niveau:",
+    options=["Postcode (PC4)", "Gemeente"],
+    index=0  # Standaard: Postcode niveau
+)
 
 # Controleer welke kolommen beschikbaar zijn
 available_columns = []
@@ -537,39 +660,53 @@ with export_container:
 st.markdown("---")  # Horizontale lijn voor visuele scheiding
 
 with col1:
-    st.subheader(f"PC4 Kaart - {selected_column_display}")
+    niveau_label = "Gemeente" if visualisatie_niveau == "Gemeente" else "PC4"
+    st.subheader(f"{niveau_label} Kaart - {selected_column_display}")
     
     # Check of er data is om te visualiseren
     if len(filtered_data) > 0:
-        # AANGEPAST: Maak de kaart met Plotly - check of we categorische of numerieke data visualiseren
-        if selected_column == 'voorstel_gebied_cat':
-            # Categorische visualisatie voor voorstel_gebied_cat
+        # Bepaal de te visualiseren data op basis van gekozen niveau
+        if visualisatie_niveau == "Gemeente":
+            # Aggregeer data naar gemeenteniveau
+            visualisation_data = aggregate_to_gemeente(filtered_data)
+            if len(visualisation_data) == 0 or not isinstance(visualisation_data, gpd.GeoDataFrame):
+                st.warning("Kon geen gemeente-niveau kaart maken. Teruggevallen op PC4-niveau.")
+                visualisation_data = filtered_data
+            else:
+                st.info(f"Kaart toont {len(visualisation_data)} gemeenten.")
+        else:
+            # Gebruik PC4 niveau (standaard)
+            visualisation_data = filtered_data
+            
+        # Check of we categorische of numerieke data visualiseren
+        if selected_column == 'voorstel_gebied_cat' or (hasattr(visualisation_data[selected_column], 'dtype') and pd.api.types.is_object_dtype(visualisation_data[selected_column].dtype)):
+            # Categorische visualisatie voor voorstel_gebied_cat en andere object/string kolommen
             fig = px.choropleth_mapbox(
-                filtered_data,
-                geojson=filtered_data.geometry,
-                locations=filtered_data.index,
+                visualisation_data,
+                geojson=visualisation_data.geometry,
+                locations=visualisation_data.index,
                 color=selected_column,
                 color_discrete_sequence=monuta_palette,  # Gebruik Monuta's kleuren palette voor categorieën
                 mapbox_style="carto-positron",
                 zoom=6.5,
                 center={"lat": 52.1326, "lon": 5.2913},  # Centreer op Nederland
                 opacity=0.7,
-                hover_data=['PC4', 'provincie', 'gemeente', 'woonplaats', selected_column],
+                hover_data=['gemeente', 'woonplaats', selected_column] if visualisatie_niveau == "Postcode (PC4)" and 'woonplaats' in visualisation_data.columns else ['gemeente', selected_column],
                 labels={selected_column: selected_column_display}
             )
         else:
-            # Numerieke visualisatie voor andere kolommen
+            # Numerieke visualisatie voor andere kolommen - NIEUWE KLEURENSCHAAL
             fig = px.choropleth_mapbox(
-                filtered_data,
-                geojson=filtered_data.geometry,
-                locations=filtered_data.index,
+                visualisation_data,
+                geojson=visualisation_data.geometry,
+                locations=visualisation_data.index,
                 color=selected_column,
-                color_continuous_scale=monuta_palette,  # Monuta's kleuren palette
+                color_continuous_scale=rood_grijs_groen_palette,  # NIEUW: Rood-grijs-groen palette
                 mapbox_style="carto-positron",
                 zoom=6.5,
                 center={"lat": 52.1326, "lon": 5.2913},  # Centreer op Nederland
                 opacity=0.7,
-                hover_data=['PC4', 'provincie', 'gemeente', 'woonplaats', selected_column],
+                hover_data=['gemeente', 'woonplaats', selected_column] if visualisatie_niveau == "Postcode (PC4)" and 'woonplaats' in visualisation_data.columns else ['gemeente', selected_column],
                 labels={selected_column: selected_column_display}
             )
         
@@ -579,12 +716,25 @@ with col1:
         st.warning("Geen data beschikbaar met de huidige filters.")
 
 with col2:
-    st.subheader("Statistieken")
+    niveau_label = "gemeente" if visualisatie_niveau == "Gemeente" else "PC4-gebied"
+    st.subheader(f"Statistieken ({visualisatie_niveau})")
     
     if len(filtered_data) > 0:
+        # Bepaal de data voor statistieken op basis van niveau
+        if visualisatie_niveau == "Gemeente":
+            stats_data = aggregate_to_gemeente(filtered_data)
+            if isinstance(stats_data, pd.DataFrame) and len(stats_data) > 0:
+                # Gebruik geaggregeerde data voor statistieken
+                pass
+            else:
+                stats_data = filtered_data
+                st.warning("Kon statistieken niet berekenen op gemeenteniveau. Teruggevallen op PC4-niveau.")
+        else:
+            stats_data = filtered_data
+            
         # Bereken het algehele marktaandeel voor de geselecteerde regio's
-        total_sterfte = filtered_data['sterfte_2023'].sum()
-        total_uitvaarten = filtered_data['uitvaarten_2023'].sum()
+        total_sterfte = stats_data['sterfte_2023'].sum()
+        total_uitvaarten = stats_data['uitvaarten_2023'].sum()
         
         if total_sterfte > 0:
             overall_marktaandeel = (total_uitvaarten / total_sterfte) * 100
@@ -596,37 +746,39 @@ with col2:
         
         with stat_col1:
             # Eerste kolom statistieken
-            st.metric("Aantal PC4-gebieden", len(filtered_data))
+            st.metric(f"Aantal {niveau_label}en", len(stats_data))
             st.metric("Marktaandeel 2023", f"{round(overall_marktaandeel, 2)}%")
             
             # Controleer en bereken inwoners totaal
-            if 'inwoners' in filtered_data.columns:
-                total_inwoners = filtered_data['inwoners'].sum()
+            if 'inwoners' in stats_data.columns:
+                total_inwoners = stats_data['inwoners'].sum()
                 st.metric("Totaal inwoners", f"{int(total_inwoners):,}".replace(",", "."))
                 
             # Bereken 65-plussers
-            if 'inwoners_65plus' in filtered_data.columns:
-                total_65plus = filtered_data['inwoners_65plus'].sum()
+            if 'inwoners_65plus' in stats_data.columns:
+                total_65plus = stats_data['inwoners_65plus'].sum()
                 st.metric("Inwoners 65+", f"{int(total_65plus):,}".replace(",", "."))
                 
             # Bereken uitkeringen percentage indien beschikbaar
-            if 'uitkeringen' in filtered_data.columns and 'inwoners' in filtered_data.columns:
+            if 'uitkeringen' in stats_data.columns and 'inwoners' in stats_data.columns:
                 # Percentage uitkeringen berekenen
-                totaal_uitkeringen = filtered_data['uitkeringen'].sum()
-                totaal_inwoners = filtered_data['inwoners'].sum()
+                totaal_uitkeringen = stats_data['uitkeringen'].sum()
+                totaal_inwoners = stats_data['inwoners'].sum()
                 if totaal_inwoners > 0:
                     percentage_uitkeringen = (totaal_uitkeringen / totaal_inwoners) * 100
                     st.metric("Percentage uitkering", f"{round(percentage_uitkeringen, 1)}%")
                     
-            # NIEUW: Toon statistiek over voorstel gebied categorieën als die kolom beschikbaar is
-            if 'voorstel_gebied_cat' in filtered_data.columns:
-                # Tel het aantal gebieden per categorie
-                cat_counts = filtered_data['voorstel_gebied_cat'].value_counts()
-                # Toon de meest voorkomende categorie
-                if not cat_counts.empty:
-                    top_cat = cat_counts.index[0]
-                    top_count = cat_counts.iloc[0]
-                    st.metric("Meest voorkomende categorie", f"{top_cat} ({top_count})")
+            # Toon statistiek over voorstel gebied categorieën als die kolom beschikbaar is
+            for kolom in gebied_cat_kolommen:
+                if kolom in stats_data.columns:
+                    # Tel het aantal gebieden per categorie
+                    cat_counts = stats_data[kolom].value_counts()
+                    # Toon de meest voorkomende categorie
+                    if not cat_counts.empty:
+                        top_cat = cat_counts.index[0]
+                        top_count = cat_counts.iloc[0]
+                        st.metric("Meest voorkomende categorie", f"{top_cat} ({top_count})")
+                    break
         
         with stat_col2:
             # Tweede kolom statistieken
@@ -634,57 +786,59 @@ with col2:
             st.metric("Uitvaarten 2023", int(total_uitvaarten))
             
             # Nieuwe statistieken toevoegen
-            if 'uitvaarten_2024' in filtered_data.columns:
-                st.metric("Uitvaarten 2024", int(filtered_data['uitvaarten_2024'].sum()))
+            if 'uitvaarten_2024' in stats_data.columns:
+                st.metric("Uitvaarten 2024", int(stats_data['uitvaarten_2024'].sum()))
                 
-            if 'uitvaarten_2025' in filtered_data.columns:
-                st.metric("Uitvaarten 2025", int(filtered_data['uitvaarten_2025'].sum()))
+            if 'uitvaarten_2025' in stats_data.columns:
+                st.metric("Uitvaarten 2025", int(stats_data['uitvaarten_2025'].sum()))
                 
-            if 'aantal_verzekerden' in filtered_data.columns:
-                st.metric("Aantal verzekerden", f"{int(filtered_data['aantal_verzekerden'].sum()):,}".replace(",", "."))
+            if 'aantal_verzekerden' in stats_data.columns:
+                st.metric("Aantal verzekerden", f"{int(stats_data['aantal_verzekerden'].sum()):,}".replace(",", "."))
                 
-            if 'woz' in filtered_data.columns:
+            if 'woz' in stats_data.columns:
                 # Gewogen gemiddelde WOZ-waarde berekenen op basis van inwoners
-                if 'inwoners' in filtered_data.columns and filtered_data['inwoners'].sum() > 0:
+                if 'inwoners' in stats_data.columns and stats_data['inwoners'].sum() > 0:
                     # Bereken gewogen gemiddelde: som(woz * inwoners) / som(inwoners)
-                    gewogen_woz = (filtered_data['woz'] * filtered_data['inwoners']).sum() / filtered_data['inwoners'].sum()
+                    gewogen_woz = (stats_data['woz'] * stats_data['inwoners']).sum() / stats_data['inwoners'].sum()
                     # Vermenigvuldig met 1000 omdat de waarden in duizenden zijn
                     gewogen_woz_eur = gewogen_woz * 1000
                     st.metric("Gemiddelde WOZ-waarde", f"€ {int(gewogen_woz_eur):,}".replace(",", "."))
                 else:
                     # Fallback naar regulier gemiddelde als inwoners niet beschikbaar zijn
-                    gemiddelde_woz = filtered_data['woz'].mean() * 1000  # Vermenigvuldig met 1000
+                    gemiddelde_woz = stats_data['woz'].mean() * 1000  # Vermenigvuldig met 1000
                     st.metric("Gemiddelde WOZ-waarde", f"€ {int(gemiddelde_woz):,}".replace(",", ".") + " (ongewogen)")
                     
-            if 'reistijd_min' in filtered_data.columns:
+            if 'reistijd_min' in stats_data.columns:
                 # Gemiddelde reistijd berekenen
-                gem_reistijd = filtered_data['reistijd_min'].mean()
+                gem_reistijd = stats_data['reistijd_min'].mean()
                 st.metric("Gem. reistijd (min)", round(gem_reistijd, 1))
 
-        # NIEUW: Als voorstel_gebied_cat beschikbaar is, toon een verdeling van de categorieën
-        if 'voorstel_gebied_cat' in filtered_data.columns:
-            st.subheader("Verdeling gebied categorieën")
-            cat_counts = filtered_data['voorstel_gebied_cat'].value_counts().reset_index()
-            cat_counts.columns = ['Categorie', 'Aantal']
-            
-            # Maak een staafdiagram van de categorie verdeling
-            fig = px.bar(
-                cat_counts, 
-                x='Categorie', 
-                y='Aantal',
-                color='Categorie',
-                color_discrete_sequence=monuta_palette,
-                labels={'Categorie': 'Voorstel gebied categorie', 'Aantal': 'Aantal PC4-gebieden'}
-            )
-            
-            fig.update_layout(showlegend=False)
-            st.plotly_chart(fig, use_container_width=True)
+        # Als voorstel_gebied_cat beschikbaar is, toon een verdeling van de categorieën
+        for kolom in gebied_cat_kolommen:
+            if kolom in stats_data.columns:
+                st.subheader("Verdeling gebied categorieën")
+                cat_counts = stats_data[kolom].value_counts().reset_index()
+                cat_counts.columns = ['Categorie', 'Aantal']
+                
+                # Maak een staafdiagram van de categorie verdeling
+                fig = px.bar(
+                    cat_counts, 
+                    x='Categorie', 
+                    y='Aantal',
+                    color='Categorie',
+                    color_discrete_sequence=monuta_palette,
+                    labels={'Categorie': 'Voorstel gebied categorie', 'Aantal': f'Aantal {niveau_label}en'}
+                )
+                
+                fig.update_layout(showlegend=False)
+                st.plotly_chart(fig, use_container_width=True)
+                break
         
         # Top 5 PC4-gebieden op basis van marktaandeel
-        st.subheader("Top 5 PC4-gebieden (hoogste marktaandeel)")
+        st.subheader(f"Top 5 {niveau_label}en (hoogste marktaandeel)")
         
-        # Bereken marktaandeel per PC4 (vermijd delen door nul)
-        top_data = filtered_data.copy()
+        # Bereken marktaandeel per gebied (vermijd delen door nul)
+        top_data = stats_data.copy()
         top_data['marktaandeel'] = np.where(
             top_data['sterfte_2023'] > 0,
             top_data['uitvaarten_2023'] / top_data['sterfte_2023'] * 100,
@@ -694,13 +848,23 @@ with col2:
         # Filter gebieden met ten minste 1 sterfgeval voor betekenisvolle ranking
         valid_data = top_data[top_data['sterfte_2023'] > 0]
         
-        # Top 5 hoogste marktaandeel
-        columns_to_display = ['PC4', 'gemeente', 'woonplaats', 'marktaandeel', 'sterfte_2023', 'uitvaarten_2023']
+        # Bepaal welke kolommen te tonen in de tabel
+        if visualisatie_niveau == "Gemeente":
+            columns_to_display = ['gemeente', 'marktaandeel', 'sterfte_2023', 'uitvaarten_2023']
+        else:
+            columns_to_display = ['PC4', 'gemeente', 'woonplaats', 'marktaandeel', 'sterfte_2023', 'uitvaarten_2023']
         
         # Voeg voorstel_gebied_cat toe aan de weergave indien beschikbaar
-        if 'voorstel_gebied_cat' in valid_data.columns:
-            columns_to_display.insert(3, 'voorstel_gebied_cat')  # Voeg voorstel_gebied_cat toe na woonplaats
+        for kolom in gebied_cat_kolommen:
+            if kolom in valid_data.columns:
+                # Voeg voorstel_gebied_cat toe na woonplaats of na gemeente
+                if visualisatie_niveau == "Gemeente":
+                    columns_to_display.insert(1, kolom)  # Na gemeente
+                else:
+                    columns_to_display.insert(3, kolom)  # Na woonplaats
+                break
             
+        # Top 5 hoogste marktaandeel
         top5 = valid_data.sort_values(by='marktaandeel', ascending=False)[columns_to_display].head(5)
         
         # Formatteer marktaandeel als percentage
@@ -709,7 +873,7 @@ with col2:
         st.dataframe(top5)
         
         # Bottom 5 PC4-gebieden op basis van marktaandeel
-        st.subheader("Laagste 5 PC4-gebieden (laagste marktaandeel)")
+        st.subheader(f"Laagste 5 {niveau_label}en (laagste marktaandeel)")
         
         # Bottom 5 laagste marktaandeel
         bottom5 = valid_data.sort_values(by='marktaandeel', ascending=True)[columns_to_display].head(5)
@@ -723,4 +887,13 @@ with col2:
 
 # Optionele ruwe data weergave
 if st.checkbox("Toon ruwe data"):
-    st.dataframe(filtered_data)
+    # Toon data afhankelijk van het geselecteerde niveau
+    if visualisatie_niveau == "Gemeente" and len(filtered_data) > 0:
+        gemeente_data = aggregate_to_gemeente(filtered_data)
+        if isinstance(gemeente_data, pd.DataFrame) and len(gemeente_data) > 0:
+            st.dataframe(gemeente_data.drop(columns=['geometry']) if 'geometry' in gemeente_data.columns else gemeente_data)
+        else:
+            st.dataframe(filtered_data.drop(columns=['geometry']) if 'geometry' in filtered_data.columns else filtered_data)
+            st.warning("Kon geen gemeente-niveau data genereren. Toon PC4-niveau data.")
+    else:
+        st.dataframe(filtered_data.drop(columns=['geometry']) if 'geometry' in filtered_data.columns else filtered_data)
