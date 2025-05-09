@@ -166,7 +166,7 @@ def load_data(excel_path, shapefile_path):
             df = df.dropna(subset=['woonplaats'])
         
         # Controleer welke kolommen daadwerkelijk bestaan in het dataframe
-        expected_columns = ['provincie', 'gemeente', 'woonplaats', 'cluster', 'voorstel_benaming_uvb', 'voorstel_onderneming', 'voorstel_gebied_cat']
+        expected_columns = ['provincie', 'gemeente', 'woonplaats', 'cluster', 'voorstel_benaming_uvb', 'voorstel_onderneming']
         existing_columns = [col for col in expected_columns if col in df.columns]
         
         # Log welke kolommen ontbreken
@@ -197,7 +197,7 @@ def load_data(excel_path, shapefile_path):
             return df, netherlands, merged_data
         
         # Aanwezigheid van belangrijke kolommen controleren en eventueel defaults instellen
-        for col in ['inwoners', 'inwoners_65plus', 'sterfte_2023', 'uitvaarten_2023', 'uitvaarten_2024', 'uitvaarten_2025', 'aantal_verzekerden', 'woz', 'uitkeringen', 'reistijd_min']:
+        for col in ['inwoners', 'sterfte_2023', 'uitvaarten_2023', 'uitvaarten_2024', 'uitvaarten_2025', 'aantal_verzekerden', 'reistijd_min']:
             if col not in merged_data.columns:
                 print(f"Kolom {col} ontbreekt in de data en wordt aangemaakt met default waarden.")
                 merged_data[col] = 0
@@ -225,20 +225,22 @@ def calculate_derived_metrics(data):
             0
         )
     
-    # Percentage uitkeringen berekenen
-    if 'uitkeringen' in data.columns and 'inwoners' in data.columns:
-        data['percentage_uitkeringen'] = np.where(
+    # Percentage verzekerden berekenen
+    if 'aantal_verzekerden' in data.columns and 'inwoners' in data.columns:
+        data['percentage_verzekerden'] = np.where(
             data['inwoners'] > 0,
-            data['uitkeringen'] / data['inwoners'] * 100,
+            data['aantal_verzekerden'] / data['inwoners'] * 100,
             0
         )
     
     return data
 
-# Nieuwe functie om te aggregeren naar gemeenteniveau
+# Vervang de huidige aggregate_to_gemeente functie met deze robuustere versie
+
 def aggregate_to_gemeente(data):
     """
-    Aggregeert data van PC4-niveau naar gemeenteniveau.
+    Aggregeert data van PC4-niveau naar gemeenteniveau met uitgebreide foutenafhandeling.
+    Probeert meerdere methoden om geometrieën samen te voegen, met fallbacks.
     """
     if 'gemeente' not in data.columns:
         st.warning("Gemeente kolom niet gevonden, kan niet aggregeren.")
@@ -249,17 +251,13 @@ def aggregate_to_gemeente(data):
     
     # Aggregeer de numerieke kolommen
     numeric_columns = [
-        'inwoners', 'inwoners_65plus', 'sterfte_2023', 'uitvaarten_2023', 
+        'inwoners', 'sterfte_2023', 'uitvaarten_2023', 
         'uitvaarten_2024', 'uitvaarten_2025', 'aantal_verzekerden',
-        'uitkeringen', 'reistijd_min'
+        'reistijd_min'
     ]
     
     # Selecteer alleen bestaande kolommen
     numeric_columns = [col for col in numeric_columns if col in data_copy.columns]
-    
-    # Bereken gemiddelde WOZ-waarde gewogen op inwoners
-    if 'woz' in data_copy.columns and 'inwoners' in data_copy.columns:
-        data_copy['woz_inwoners_product'] = data_copy['woz'] * data_copy['inwoners']
     
     # Groeperen op gemeente en aggregeren
     gemeente_aggs = {}
@@ -269,23 +267,8 @@ def aggregate_to_gemeente(data):
         if col in data_copy.columns:
             gemeente_aggs[col] = 'sum'
     
-    # Speciale gevallen
-    if 'woz' in data_copy.columns:
-        gemeente_aggs['woz'] = 'mean'  # Standaard gemiddelde
-    
-    if 'woz_inwoners_product' in data_copy.columns:
-        gemeente_aggs['woz_inwoners_product'] = 'sum'
-    
     if 'reistijd_min' in data_copy.columns:
         gemeente_aggs['reistijd_min'] = 'mean'  # Gemiddelde reistijd
-        
-    # Als voorstel_gebied_cat bestaat, neem de meest voorkomende waarde
-    if 'voorstel_gebied_cat' in data_copy.columns:
-        # Functie om meest voorkomende waarde te vinden
-        def most_common(series):
-            return series.mode().iloc[0] if not series.mode().empty else "Onbekend"
-        
-        gemeente_aggs['voorstel_gebied_cat'] = most_common
     
     # Aggregeer op gemeente
     gemeente_data = data_copy.groupby('gemeente').agg(gemeente_aggs).reset_index()
@@ -298,31 +281,124 @@ def aggregate_to_gemeente(data):
             0
         )
     
-    if 'uitkeringen' in gemeente_data.columns and 'inwoners' in gemeente_data.columns:
-        gemeente_data['percentage_uitkeringen'] = np.where(
+    # Percentage verzekerden berekenen
+    if 'aantal_verzekerden' in gemeente_data.columns and 'inwoners' in gemeente_data.columns:
+        gemeente_data['percentage_verzekerden'] = np.where(
             gemeente_data['inwoners'] > 0,
-            gemeente_data['uitkeringen'] / gemeente_data['inwoners'] * 100,
+            gemeente_data['aantal_verzekerden'] / gemeente_data['inwoners'] * 100,
             0
         )
-    
-    # Bereken gewogen gemiddelde WOZ indien beschikbaar
-    if 'woz_inwoners_product' in gemeente_data.columns and 'inwoners' in gemeente_data.columns:
-        gemeente_data['woz'] = gemeente_data['woz_inwoners_product'] / gemeente_data['inwoners']
-        gemeente_data = gemeente_data.drop(columns=['woz_inwoners_product'])
     
     # Maak een GeoPandas dataframe van het resultaat
     # Voor visualisatie hebben we geometrie nodig
     if isinstance(data, gpd.GeoDataFrame):
-        # Lossen geometrie op door het samenvoegen (dissolve) van de PC4-geometrieën per gemeente
-        gemeente_geometries = data.dissolve(by='gemeente')
-        
-        # Samenvoegen van de geaggregeerde data met de geometrieën
-        gemeente_gdf = gpd.GeoDataFrame(
-            gemeente_data.merge(gemeente_geometries.reset_index()[['gemeente', 'geometry']], on='gemeente'),
-            geometry='geometry'
-        )
-        
-        return gemeente_gdf
+        try:
+            # METHODE 1: Probeer eerst de standaard methode maar met een hogere simplificatie
+            # Maak een kopie met sterk vereenvoudigde geometrieën
+            simple_data = data.copy()
+            # Vereenvoudig geometrieën agressiever voor dissolve
+            simple_data['geometry'] = simple_data['geometry'].simplify(tolerance=0.01, preserve_topology=True)
+            # Buffer met nul om kleine inconsistenties te repareren
+            simple_data['geometry'] = simple_data['geometry'].buffer(0)
+            
+            gemeente_geometries = simple_data.dissolve(by='gemeente')
+            
+            # Samenvoegen van de geaggregeerde data met de geometrieën
+            gemeente_gdf = gpd.GeoDataFrame(
+                gemeente_data.merge(gemeente_geometries.reset_index()[['gemeente', 'geometry']], on='gemeente'),
+                geometry='geometry'
+            )
+            
+            st.success("Gemeenteniveau kaart succesvol gemaakt met vereenvoudigde geometrieën.")
+            return gemeente_gdf
+            
+        except Exception as e1:
+            st.warning(f"Fout bij het samenvoegen van vereenvoudigde geometrieën: {type(e1).__name__}. Probeer methode 2.")
+            
+            try:
+                # METHODE 2: Probeer de dissolve per gemeente apart uit te voeren
+                gemeentes = data['gemeente'].unique()
+                all_geoms = []
+                
+                for gemeente in gemeentes:
+                    try:
+                        # Selecteer alle PC4-gebieden in deze gemeente
+                        gemeente_data_subset = data[data['gemeente'] == gemeente]
+                        # Probeer deze samen te voegen tot één geometrie
+                        if len(gemeente_data_subset) > 0:
+                            # Gebruik simplify en buffer om problemen te verminderen
+                            gemeente_geom = gemeente_data_subset['geometry'].simplify(0.01).buffer(0)
+                            # Probeer unary_union uit te voeren
+                            try:
+                                merged_geom = gemeente_geom.unary_union
+                                all_geoms.append((gemeente, merged_geom))
+                            except:
+                                # Als unary_union faalt, neem gewoon de eerste geometrie
+                                all_geoms.append((gemeente, gemeente_geom.iloc[0]))
+                    except:
+                        # Bij fouten, sla deze gemeente over
+                        continue
+                
+                if all_geoms:
+                    # Maak een nieuwe GeoDataFrame met de verzamelde geometrieën
+                    gemeente_gdf_from_parts = gpd.GeoDataFrame(
+                        [(g[0], g[1]) for g in all_geoms], 
+                        columns=['gemeente', 'geometry'],
+                        geometry='geometry'
+                    )
+                    
+                    # Samenvoegen met de geaggregeerde data
+                    gemeente_gdf = gpd.GeoDataFrame(
+                        gemeente_data.merge(gemeente_gdf_from_parts, on='gemeente'),
+                        geometry='geometry'
+                    )
+                    
+                    st.success("Gemeenteniveau kaart succesvol gemaakt met per-gemeente verwerking.")
+                    return gemeente_gdf
+                else:
+                    raise Exception("Geen geometrieën konden worden samengevoegd")
+                    
+            except Exception as e2:
+                st.warning(f"Fout bij methode 2 voor geometrieën: {type(e2).__name__}. Probeer methode 3.")
+                
+                try:
+                    # METHODE 3: Gebruik de centroïde van elke gemeente als punt
+                    # Groepeer per gemeente en bereken de gemiddelde centroïde
+                    gemeente_centroids = {}
+                    
+                    for gemeente in data['gemeente'].unique():
+                        gemeente_data_subset = data[data['gemeente'] == gemeente]
+                        if len(gemeente_data_subset) > 0:
+                            # Bereken een representatief punt voor deze gemeente
+                            points = [geom.centroid for geom in gemeente_data_subset['geometry']]
+                            x_coords = [p.x for p in points]
+                            y_coords = [p.y for p in points]
+                            # Gemiddelde coördinaat
+                            avg_x = sum(x_coords) / len(x_coords)
+                            avg_y = sum(y_coords) / len(y_coords)
+                            from shapely.geometry import Point
+                            gemeente_centroids[gemeente] = Point(avg_x, avg_y)
+                    
+                    # Maak een GeoDataFrame met de centroïde-punten
+                    gemeente_points = gpd.GeoDataFrame(
+                        [(gemeente, centroid) for gemeente, centroid in gemeente_centroids.items()], 
+                        columns=['gemeente', 'geometry'],
+                        geometry='geometry'
+                    )
+                    
+                    # Samenvoegen met de geaggregeerde data
+                    gemeente_gdf = gpd.GeoDataFrame(
+                        gemeente_data.merge(gemeente_points, on='gemeente'),
+                        geometry='geometry'
+                    )
+                    
+                    st.warning("Gemeenteniveau kaart gemaakt met centroïden (punten) in plaats van polygonen.")
+                    return gemeente_gdf
+                    
+                except Exception as e3:
+                    st.error(f"Alle methoden voor het maken van gemeenteniveau geometrieën zijn mislukt: {type(e3).__name__}.")
+                    # Als alle methodes mislukken, retourneer de data zonder geometrieën
+                    return gemeente_data
     else:
         # Als het geen GeoDataFrame is, geef een waarschuwing
         st.warning("Kan geen kaart maken zonder geometrie data.")
@@ -373,16 +449,13 @@ merged_data = calculate_derived_metrics(merged_data)
 column_mapping = {
     "Marktaandeel 2023": "berekend_marktaandeel_2023",
     "Inwoners": "inwoners",
-    "Inwoners 65+": "inwoners_65plus",
     "Sterfte 2023": "sterfte_2023",
     "Uitvaarten 2023": "uitvaarten_2023",
     "Uitvaarten 2024": "uitvaarten_2024",
     "Uitvaarten 2025": "uitvaarten_2025",
     "Aantal Verzekerden": "aantal_verzekerden",
-    "WOZ Waarde": "woz",
-    "Percentage Uitkeringen": "percentage_uitkeringen",
-    "Reistijd (minuten)": "reistijd_min",
-    "Voorstel Gebied Categorie": "voorstel_gebied_cat"  # Nieuwe kolom toegevoegd
+    "Percentage Verzekerden": "percentage_verzekerden",
+    "Reistijd (minuten)": "reistijd_min"
 }
 
 # Sidebar-filters
@@ -492,38 +565,6 @@ with organisatie_container:
         # Filter op voorstel benaming UVB als er een selectie is gemaakt
         if selected_uvbs:
             filtered_data = filtered_data[filtered_data['voorstel_benaming_uvb'].isin(selected_uvbs)]
-            
-    # Voorstel gebied cat filter - robuuste implementatie met verschillende mogelijke kolomnamen
-    gebied_cat_kolommen = [
-        'voorstel_gebied_cat', 
-        'voorstel gebied cat',
-        'Voorstel_gebied_cat',
-        'Voorstel gebied cat',
-        'voorstelGebiedCat',
-        'voorstel_gebied_categorie',
-        'voorstel gebied categorie'
-    ]
-
-    # Zoek welke variant van de kolomnaam in de data bestaat
-    for kolom in gebied_cat_kolommen:
-        if kolom in filtered_data.columns:
-            gebied_cat_kolom = kolom
-            gebied_cat_values = sorted(filtered_data[kolom].fillna('Onbekend').astype(str).unique().tolist())
-            selected_gebied_cats = st.multiselect(
-                "Filter op voorstel gebied categorie:",
-                gebied_cat_values,
-                default=[]
-            )
-            
-            # Filter op voorstel gebied categorie als er een selectie is gemaakt
-            if selected_gebied_cats:
-                filtered_data = filtered_data[filtered_data[kolom].isin(selected_gebied_cats)]
-            
-            # Voeg toe aan column_mapping als het nog niet bestaat
-            if "Voorstel Gebied Categorie" not in [k for k, v in column_mapping.items()]:
-                column_mapping["Voorstel Gebied Categorie"] = kolom
-            
-            break
 
 # Selecteer een kolom voor visualisatie in de statistieken aan rechterkant
 st.sidebar.subheader("Visualisatie opties")
@@ -538,7 +579,7 @@ visualisatie_niveau = st.sidebar.radio(
 # Controleer welke kolommen beschikbaar zijn
 available_columns = []
 for display_name, column_name in column_mapping.items():
-    if column_name in merged_data.columns or column_name == 'berekend_marktaandeel_2023' or column_name == 'percentage_uitkeringen':
+    if column_name in merged_data.columns or column_name == 'berekend_marktaandeel_2023' or column_name == 'percentage_verzekerden':
         available_columns.append(display_name)
 
 # Selectie van de te visualiseren metriek
@@ -611,13 +652,11 @@ with export_container:
             overall_marktaandeel = (total_uitvaarten / total_sterfte) * 100 if total_sterfte > 0 else 0
             
             total_inwoners = filtered_data['inwoners'].sum() if 'inwoners' in filtered_data.columns else 0
-            total_65plus = filtered_data['inwoners_65plus'].sum() if 'inwoners_65plus' in filtered_data.columns else 0
-            
-            gewogen_woz = (filtered_data['woz'] * filtered_data['inwoners']).sum() / filtered_data['inwoners'].sum() * 1000 if 'woz' in filtered_data.columns and 'inwoners' in filtered_data.columns and filtered_data['inwoners'].sum() > 0 else 0
-            
-            gem_reistijd = filtered_data['reistijd_min'].mean() if 'reistijd_min' in filtered_data.columns else 0
             
             total_verzekerden = filtered_data['aantal_verzekerden'].sum() if 'aantal_verzekerden' in filtered_data.columns else 0
+            percentage_verzekerden = (total_verzekerden / total_inwoners) * 100 if total_inwoners > 0 else 0
+            
+            gem_reistijd = filtered_data['reistijd_min'].mean() if 'reistijd_min' in filtered_data.columns else 0
             
             # Bepaal gebiedsnaam op basis van filters
             gebied_naam = "Heel Nederland"
@@ -634,15 +673,15 @@ with export_container:
             stats_data = {
                 'Kenmerk': [
                     'Gebied', 'Aantal PC4-gebieden', 'Marktaandeel 2023 (%)', 
-                    'Totaal inwoners', 'Inwoners 65+', 'Sterfte 2023', 
+                    'Totaal inwoners', 'Sterfte 2023', 
                     'Uitvaarten 2023', 'Uitvaarten 2024', 'Uitvaarten 2025',
-                    'Aantal verzekerden', 'Gemiddelde WOZ-waarde (€)', 'Gemiddelde reistijd (min)'
+                    'Aantal verzekerden', 'Percentage verzekerden (%)', 'Gemiddelde reistijd (min)'
                 ],
                 'Waarde': [
                     gebied_naam, len(filtered_data), round(overall_marktaandeel, 2),
-                    int(total_inwoners), int(total_65plus), int(total_sterfte),
+                    int(total_inwoners), int(total_sterfte),
                     int(total_uitvaarten), int(total_uitvaarten_2024), int(total_uitvaarten_2025),
-                    int(total_verzekerden), int(gewogen_woz), round(gem_reistijd, 1)
+                    int(total_verzekerden), round(percentage_verzekerden, 2), round(gem_reistijd, 1)
                 ]
             }
             stats_df = pd.DataFrame(stats_data)
@@ -659,6 +698,8 @@ with export_container:
 
 st.markdown("---")  # Horizontale lijn voor visuele scheiding
 
+# Vervang het visualisatiegedeelte (rond regel 560-615) met deze aangepaste versie
+
 with col1:
     niveau_label = "Gemeente" if visualisatie_niveau == "Gemeente" else "PC4"
     st.subheader(f"{niveau_label} Kaart - {selected_column_display}")
@@ -669,49 +710,121 @@ with col1:
         if visualisatie_niveau == "Gemeente":
             # Aggregeer data naar gemeenteniveau
             visualisation_data = aggregate_to_gemeente(filtered_data)
-            if len(visualisation_data) == 0 or not isinstance(visualisation_data, gpd.GeoDataFrame):
-                st.warning("Kon geen gemeente-niveau kaart maken. Teruggevallen op PC4-niveau.")
+            
+            # Controleer of visualisation_data een GeoDataFrame is met geometrie kolom
+            is_geodataframe = isinstance(visualisation_data, gpd.GeoDataFrame) and 'geometry' in visualisation_data.columns
+            
+            if not is_geodataframe:
+                st.warning("Kon geen gemeente-niveau kaart maken door problemen met geometrieën. Teruggevallen op PC4-niveau.")
                 visualisation_data = filtered_data
             else:
                 st.info(f"Kaart toont {len(visualisation_data)} gemeenten.")
         else:
             # Gebruik PC4 niveau (standaard)
             visualisation_data = filtered_data
-            
-        # Check of we categorische of numerieke data visualiseren
-        if selected_column == 'voorstel_gebied_cat' or (hasattr(visualisation_data[selected_column], 'dtype') and pd.api.types.is_object_dtype(visualisation_data[selected_column].dtype)):
-            # Categorische visualisatie voor voorstel_gebied_cat en andere object/string kolommen
-            fig = px.choropleth_mapbox(
-                visualisation_data,
-                geojson=visualisation_data.geometry,
-                locations=visualisation_data.index,
-                color=selected_column,
-                color_discrete_sequence=monuta_palette,  # Gebruik Monuta's kleuren palette voor categorieën
-                mapbox_style="carto-positron",
-                zoom=6.5,
-                center={"lat": 52.1326, "lon": 5.2913},  # Centreer op Nederland
-                opacity=0.7,
-                hover_data=['gemeente', 'woonplaats', selected_column] if visualisatie_niveau == "Postcode (PC4)" and 'woonplaats' in visualisation_data.columns else ['gemeente', selected_column],
-                labels={selected_column: selected_column_display}
-            )
-        else:
-            # Numerieke visualisatie voor andere kolommen - NIEUWE KLEURENSCHAAL
-            fig = px.choropleth_mapbox(
-                visualisation_data,
-                geojson=visualisation_data.geometry,
-                locations=visualisation_data.index,
-                color=selected_column,
-                color_continuous_scale=rood_grijs_groen_palette,  # NIEUW: Rood-grijs-groen palette
-                mapbox_style="carto-positron",
-                zoom=6.5,
-                center={"lat": 52.1326, "lon": 5.2913},  # Centreer op Nederland
-                opacity=0.7,
-                hover_data=['gemeente', 'woonplaats', selected_column] if visualisatie_niveau == "Postcode (PC4)" and 'woonplaats' in visualisation_data.columns else ['gemeente', selected_column],
-                labels={selected_column: selected_column_display}
-            )
         
-        fig.update_layout(margin={"r":0,"t":0,"l":0,"b":0}, height=600)
-        st.plotly_chart(fig, use_container_width=True)
+        # Controleer opnieuw of we een geldige GeoDataFrame hebben
+        if not isinstance(visualisation_data, gpd.GeoDataFrame) or 'geometry' not in visualisation_data.columns:
+            st.error("Kan geen kaart maken zonder geldige geometrieën.")
+        else:
+            # Maak een kopie voor visualisatie om de originele data intact te houden
+            viz_data = visualisation_data.copy()
+            
+            # Check geometrietype (polygonen of punten)
+            from shapely.geometry import Point
+            is_point_geometry = False
+            if len(viz_data) > 0:
+                # Controleer het type van de eerste geometrie
+                first_geom = viz_data.iloc[0]['geometry']
+                is_point_geometry = isinstance(first_geom, Point)
+            
+            # Check of we categorische of numerieke data visualiseren
+            is_categorical = False
+            selected_col = selected_column  # standaard kolomnaam
+            
+            # Als het een categorische kolom is
+            if selected_column in viz_data.columns and (pd.api.types.is_object_dtype(viz_data[selected_column]) or pd.api.types.is_string_dtype(viz_data[selected_column])):
+                is_categorical = True
+                viz_data[selected_column] = viz_data[selected_column].fillna("Onbekend").astype(str)
+            
+            try:
+                # Kies de juiste visualisatiemethode op basis van geometrietype
+                if is_point_geometry:
+                    # Voor punt-geometrieën gebruiken we een andere visualisatie
+                    if is_categorical:
+                        # Categorische data met punten
+                        fig = px.scatter_mapbox(
+                            viz_data,
+                            lat=viz_data.geometry.y,
+                            lon=viz_data.geometry.x,
+                            color=selected_col,
+                            color_discrete_sequence=monuta_palette,
+                            size_max=15,  # Max grootte van punten
+                            zoom=6.5,
+                            mapbox_style="carto-positron",
+                            center={"lat": 52.1326, "lon": 5.2913},
+                            hover_data=['gemeente'],
+                            labels={selected_col: selected_column_display}
+                        )
+                    else:
+                        # Numerieke data met punten
+                        fig = px.scatter_mapbox(
+                            viz_data,
+                            lat=viz_data.geometry.y,
+                            lon=viz_data.geometry.x,
+                            color=selected_column,
+                            color_continuous_scale=rood_grijs_groen_palette,
+                            size_max=15,  # Max grootte van punten
+                            zoom=6.5,
+                            mapbox_style="carto-positron",
+                            center={"lat": 52.1326, "lon": 5.2913},
+                            hover_data=['gemeente'],
+                            labels={selected_column: selected_column_display}
+                        )
+                else:
+                    # Voor polygoon-geometrieën gebruiken we de originele visualisatie
+                    if is_categorical:
+                        # Categorische data met polygonen
+                        fig = px.choropleth_mapbox(
+                            viz_data,
+                            geojson=viz_data.geometry,
+                            locations=viz_data.index,
+                            color=selected_col,
+                            color_discrete_sequence=monuta_palette,
+                            mapbox_style="carto-positron",
+                            zoom=6.5,
+                            center={"lat": 52.1326, "lon": 5.2913},
+                            opacity=0.7,
+                            hover_data=['gemeente', 'woonplaats', selected_col] if visualisatie_niveau == "Postcode (PC4)" and 'woonplaats' in viz_data.columns else ['gemeente', selected_col],
+                            labels={selected_col: selected_column_display}
+                        )
+                    else:
+                        # Numerieke data met polygonen
+                        fig = px.choropleth_mapbox(
+                            viz_data,
+                            geojson=viz_data.geometry,
+                            locations=viz_data.index,
+                            color=selected_column,
+                            color_continuous_scale=rood_grijs_groen_palette,
+                            mapbox_style="carto-positron",
+                            zoom=6.5,
+                            center={"lat": 52.1326, "lon": 5.2913},
+                            opacity=0.7,
+                            hover_data=['gemeente', 'woonplaats', selected_column] if visualisatie_niveau == "Postcode (PC4)" and 'woonplaats' in viz_data.columns else ['gemeente', selected_column],
+                            labels={selected_column: selected_column_display}
+                        )
+                
+                # Layout aanpassen
+                fig.update_layout(margin={"r":0,"t":0,"l":0,"b":0}, height=600)
+                st.plotly_chart(fig, use_container_width=True)
+            except Exception as e:
+                st.error(f"Fout bij het maken van de kaart: {type(e).__name__}. Probeer een andere weergave of dataset.")
+                st.code(str(e), language="python")
+                
+                # Als de visualisatie faalt, toon een tabel met de aggregated data als alternatief
+                st.subheader("Alternatieve weergave (tabel)")
+                display_data = viz_data.drop(columns=['geometry'])
+                st.dataframe(display_data)
     else:
         st.warning("Geen data beschikbaar met de huidige filters.")
 
@@ -740,6 +853,14 @@ with col2:
             overall_marktaandeel = (total_uitvaarten / total_sterfte) * 100
         else:
             overall_marktaandeel = 0
+            
+        # Percentage verzekerden berekenen
+        total_inwoners = stats_data['inwoners'].sum()
+        total_verzekerden = stats_data['aantal_verzekerden'].sum()
+        if total_inwoners > 0:
+            percentage_verzekerden = (total_verzekerden / total_inwoners) * 100
+        else:
+            percentage_verzekerden = 0
         
         # Statistieken in twee kolommen weergeven
         stat_col1, stat_col2 = st.columns(2)
@@ -754,31 +875,8 @@ with col2:
                 total_inwoners = stats_data['inwoners'].sum()
                 st.metric("Totaal inwoners", f"{int(total_inwoners):,}".replace(",", "."))
                 
-            # Bereken 65-plussers
-            if 'inwoners_65plus' in stats_data.columns:
-                total_65plus = stats_data['inwoners_65plus'].sum()
-                st.metric("Inwoners 65+", f"{int(total_65plus):,}".replace(",", "."))
-                
-            # Bereken uitkeringen percentage indien beschikbaar
-            if 'uitkeringen' in stats_data.columns and 'inwoners' in stats_data.columns:
-                # Percentage uitkeringen berekenen
-                totaal_uitkeringen = stats_data['uitkeringen'].sum()
-                totaal_inwoners = stats_data['inwoners'].sum()
-                if totaal_inwoners > 0:
-                    percentage_uitkeringen = (totaal_uitkeringen / totaal_inwoners) * 100
-                    st.metric("Percentage uitkering", f"{round(percentage_uitkeringen, 1)}%")
-                    
-            # Toon statistiek over voorstel gebied categorieën als die kolom beschikbaar is
-            for kolom in gebied_cat_kolommen:
-                if kolom in stats_data.columns:
-                    # Tel het aantal gebieden per categorie
-                    cat_counts = stats_data[kolom].value_counts()
-                    # Toon de meest voorkomende categorie
-                    if not cat_counts.empty:
-                        top_cat = cat_counts.index[0]
-                        top_count = cat_counts.iloc[0]
-                        st.metric("Meest voorkomende categorie", f"{top_cat} ({top_count})")
-                    break
+            # Percentage verzekerden
+            st.metric("Percentage verzekerden", f"{round(percentage_verzekerden, 2)}%")
         
         with stat_col2:
             # Tweede kolom statistieken
@@ -794,47 +892,13 @@ with col2:
                 
             if 'aantal_verzekerden' in stats_data.columns:
                 st.metric("Aantal verzekerden", f"{int(stats_data['aantal_verzekerden'].sum()):,}".replace(",", "."))
-                
-            if 'woz' in stats_data.columns:
-                # Gewogen gemiddelde WOZ-waarde berekenen op basis van inwoners
-                if 'inwoners' in stats_data.columns and stats_data['inwoners'].sum() > 0:
-                    # Bereken gewogen gemiddelde: som(woz * inwoners) / som(inwoners)
-                    gewogen_woz = (stats_data['woz'] * stats_data['inwoners']).sum() / stats_data['inwoners'].sum()
-                    # Vermenigvuldig met 1000 omdat de waarden in duizenden zijn
-                    gewogen_woz_eur = gewogen_woz * 1000
-                    st.metric("Gemiddelde WOZ-waarde", f"€ {int(gewogen_woz_eur):,}".replace(",", "."))
-                else:
-                    # Fallback naar regulier gemiddelde als inwoners niet beschikbaar zijn
-                    gemiddelde_woz = stats_data['woz'].mean() * 1000  # Vermenigvuldig met 1000
-                    st.metric("Gemiddelde WOZ-waarde", f"€ {int(gemiddelde_woz):,}".replace(",", ".") + " (ongewogen)")
                     
             if 'reistijd_min' in stats_data.columns:
                 # Gemiddelde reistijd berekenen
                 gem_reistijd = stats_data['reistijd_min'].mean()
                 st.metric("Gem. reistijd (min)", round(gem_reistijd, 1))
-
-        # Als voorstel_gebied_cat beschikbaar is, toon een verdeling van de categorieën
-        for kolom in gebied_cat_kolommen:
-            if kolom in stats_data.columns:
-                st.subheader("Verdeling gebied categorieën")
-                cat_counts = stats_data[kolom].value_counts().reset_index()
-                cat_counts.columns = ['Categorie', 'Aantal']
-                
-                # Maak een staafdiagram van de categorie verdeling
-                fig = px.bar(
-                    cat_counts, 
-                    x='Categorie', 
-                    y='Aantal',
-                    color='Categorie',
-                    color_discrete_sequence=monuta_palette,
-                    labels={'Categorie': 'Voorstel gebied categorie', 'Aantal': f'Aantal {niveau_label}en'}
-                )
-                
-                fig.update_layout(showlegend=False)
-                st.plotly_chart(fig, use_container_width=True)
-                break
         
-        # Top 5 PC4-gebieden op basis van marktaandeel
+        # Top 5 gebieden op basis van marktaandeel
         st.subheader(f"Top 5 {niveau_label}en (hoogste marktaandeel)")
         
         # Bereken marktaandeel per gebied (vermijd delen door nul)
@@ -845,41 +909,46 @@ with col2:
             0
         )
         
+        # Bereken percentage verzekerden per gebied (vermijd delen door nul)
+        top_data['perc_verzekerden'] = np.where(
+            top_data['inwoners'] > 0,
+            top_data['aantal_verzekerden'] / top_data['inwoners'] * 100,
+            0
+        )
+        
         # Filter gebieden met ten minste 1 sterfgeval voor betekenisvolle ranking
         valid_data = top_data[top_data['sterfte_2023'] > 0]
         
         # Bepaal welke kolommen te tonen in de tabel
         if visualisatie_niveau == "Gemeente":
-            columns_to_display = ['gemeente', 'marktaandeel', 'sterfte_2023', 'uitvaarten_2023']
+            columns_to_display = ['gemeente', 'marktaandeel', 'perc_verzekerden', 'sterfte_2023', 'uitvaarten_2023']
         else:
-            columns_to_display = ['PC4', 'gemeente', 'woonplaats', 'marktaandeel', 'sterfte_2023', 'uitvaarten_2023']
-        
-        # Voeg voorstel_gebied_cat toe aan de weergave indien beschikbaar
-        for kolom in gebied_cat_kolommen:
-            if kolom in valid_data.columns:
-                # Voeg voorstel_gebied_cat toe na woonplaats of na gemeente
-                if visualisatie_niveau == "Gemeente":
-                    columns_to_display.insert(1, kolom)  # Na gemeente
-                else:
-                    columns_to_display.insert(3, kolom)  # Na woonplaats
-                break
+            columns_to_display = ['PC4', 'gemeente', 'woonplaats', 'marktaandeel', 'perc_verzekerden', 'sterfte_2023', 'uitvaarten_2023']
             
         # Top 5 hoogste marktaandeel
         top5 = valid_data.sort_values(by='marktaandeel', ascending=False)[columns_to_display].head(5)
         
-        # Formatteer marktaandeel als percentage
+        # Formatteer marktaandeel en percentage verzekerden als percentage
         top5['marktaandeel'] = top5['marktaandeel'].round(2).astype(str) + '%'
+        top5['perc_verzekerden'] = top5['perc_verzekerden'].round(2).astype(str) + '%'
+        
+        # Hernoem kolommen voor betere weergave
+        top5 = top5.rename(columns={'marktaandeel': 'Marktaandeel', 'perc_verzekerden': 'Perc. verzekerden'})
         
         st.dataframe(top5)
         
-        # Bottom 5 PC4-gebieden op basis van marktaandeel
+        # Bottom 5 gebieden op basis van marktaandeel
         st.subheader(f"Laagste 5 {niveau_label}en (laagste marktaandeel)")
         
         # Bottom 5 laagste marktaandeel
         bottom5 = valid_data.sort_values(by='marktaandeel', ascending=True)[columns_to_display].head(5)
         
-        # Formatteer marktaandeel als percentage
+        # Formatteer marktaandeel en percentage verzekerden als percentage
         bottom5['marktaandeel'] = bottom5['marktaandeel'].round(2).astype(str) + '%'
+        bottom5['perc_verzekerden'] = bottom5['perc_verzekerden'].round(2).astype(str) + '%'
+        
+        # Hernoem kolommen voor betere weergave
+        bottom5 = bottom5.rename(columns={'marktaandeel': 'Marktaandeel', 'perc_verzekerden': 'Perc. verzekerden'})
         
         st.dataframe(bottom5)
     else:
@@ -891,9 +960,14 @@ if st.checkbox("Toon ruwe data"):
     if visualisatie_niveau == "Gemeente" and len(filtered_data) > 0:
         gemeente_data = aggregate_to_gemeente(filtered_data)
         if isinstance(gemeente_data, pd.DataFrame) and len(gemeente_data) > 0:
-            st.dataframe(gemeente_data.drop(columns=['geometry']) if 'geometry' in gemeente_data.columns else gemeente_data)
+            # Toon de data zonder geometrie kolom
+            display_data = gemeente_data.drop(columns=['geometry']) if 'geometry' in gemeente_data.columns else gemeente_data
+            st.dataframe(display_data)
         else:
-            st.dataframe(filtered_data.drop(columns=['geometry']) if 'geometry' in filtered_data.columns else filtered_data)
+            display_data = filtered_data.drop(columns=['geometry']) if 'geometry' in filtered_data.columns else filtered_data
+            st.dataframe(display_data)
             st.warning("Kon geen gemeente-niveau data genereren. Toon PC4-niveau data.")
     else:
-        st.dataframe(filtered_data.drop(columns=['geometry']) if 'geometry' in filtered_data.columns else filtered_data)
+        display_data = filtered_data.drop(columns=['geometry']) if 'geometry' in filtered_data.columns else filtered_data
+        st.dataframe(display_data)
+                
