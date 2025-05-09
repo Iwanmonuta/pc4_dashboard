@@ -284,7 +284,8 @@ column_mapping = {
     "Aantal Verzekerden": "aantal_verzekerden",
     "WOZ Waarde": "woz",
     "Percentage Uitkeringen": "percentage_uitkeringen",
-    "Reistijd (minuten)": "reistijd_min"
+    "Reistijd (minuten)": "reistijd_min",
+    "Voorstel Gebied Categorie": "voorstel_gebied_cat"  # NIEUW: Voeg de nieuwe kolom toe
 }
 
 # Sidebar-filters
@@ -394,6 +395,19 @@ with organisatie_container:
         # Filter op voorstel benaming UVB als er een selectie is gemaakt
         if selected_uvbs:
             filtered_data = filtered_data[filtered_data['voorstel_benaming_uvb'].isin(selected_uvbs)]
+            
+    # NIEUW: Voorstel gebied cat filter - alleen als kolom bestaat
+    if 'voorstel_gebied_cat' in filtered_data.columns:
+        gebied_cat_values = sorted(filtered_data['voorstel_gebied_cat'].fillna('Onbekend').astype(str).unique().tolist())
+        selected_gebied_cats = st.multiselect(
+            "Filter op voorstel gebied categorie:",
+            gebied_cat_values,
+            default=[]
+        )
+        
+        # Filter op voorstel gebied categorie als er een selectie is gemaakt
+        if selected_gebied_cats:
+            filtered_data = filtered_data[filtered_data['voorstel_gebied_cat'].isin(selected_gebied_cats)]
 
 # Selecteer een kolom voor visualisatie in de statistieken aan rechterkant
 st.sidebar.subheader("Visualisatie opties")
@@ -523,24 +537,41 @@ with export_container:
 st.markdown("---")  # Horizontale lijn voor visuele scheiding
 
 with col1:
-    st.subheader(f"PC4 Kaart - {selected_column_display}")  # Altijd marktaandeel in de titel
+    st.subheader(f"PC4 Kaart - {selected_column_display}")
     
     # Check of er data is om te visualiseren
     if len(filtered_data) > 0:
-        # Maak de kaart met Plotly - altijd marktaandeel tonen
-        fig = px.choropleth_mapbox(
-            filtered_data,
-            geojson=filtered_data.geometry,
-            locations=filtered_data.index,
-            color=selected_column,  # Altijd marktaandeel visualiseren
-            color_continuous_scale=monuta_palette,  # Monuta's kleuren palette
-            mapbox_style="carto-positron",
-            zoom=6.5,
-            center={"lat": 52.1326, "lon": 5.2913},  # Centreer op Nederland
-            opacity=0.7,
-            hover_data=['PC4', 'provincie', 'gemeente', 'woonplaats', selected_column],
-            labels={selected_column: selected_column_display}
-        )
+        # AANGEPAST: Maak de kaart met Plotly - check of we categorische of numerieke data visualiseren
+        if selected_column == 'voorstel_gebied_cat':
+            # Categorische visualisatie voor voorstel_gebied_cat
+            fig = px.choropleth_mapbox(
+                filtered_data,
+                geojson=filtered_data.geometry,
+                locations=filtered_data.index,
+                color=selected_column,
+                color_discrete_sequence=monuta_palette,  # Gebruik Monuta's kleuren palette voor categorieën
+                mapbox_style="carto-positron",
+                zoom=6.5,
+                center={"lat": 52.1326, "lon": 5.2913},  # Centreer op Nederland
+                opacity=0.7,
+                hover_data=['PC4', 'provincie', 'gemeente', 'woonplaats', selected_column],
+                labels={selected_column: selected_column_display}
+            )
+        else:
+            # Numerieke visualisatie voor andere kolommen
+            fig = px.choropleth_mapbox(
+                filtered_data,
+                geojson=filtered_data.geometry,
+                locations=filtered_data.index,
+                color=selected_column,
+                color_continuous_scale=monuta_palette,  # Monuta's kleuren palette
+                mapbox_style="carto-positron",
+                zoom=6.5,
+                center={"lat": 52.1326, "lon": 5.2913},  # Centreer op Nederland
+                opacity=0.7,
+                hover_data=['PC4', 'provincie', 'gemeente', 'woonplaats', selected_column],
+                labels={selected_column: selected_column_display}
+            )
         
         fig.update_layout(margin={"r":0,"t":0,"l":0,"b":0}, height=600)
         st.plotly_chart(fig, use_container_width=True)
@@ -586,6 +617,16 @@ with col2:
                 if totaal_inwoners > 0:
                     percentage_uitkeringen = (totaal_uitkeringen / totaal_inwoners) * 100
                     st.metric("Percentage uitkering", f"{round(percentage_uitkeringen, 1)}%")
+                    
+            # NIEUW: Toon statistiek over voorstel gebied categorieën als die kolom beschikbaar is
+            if 'voorstel_gebied_cat' in filtered_data.columns:
+                # Tel het aantal gebieden per categorie
+                cat_counts = filtered_data['voorstel_gebied_cat'].value_counts()
+                # Toon de meest voorkomende categorie
+                if not cat_counts.empty:
+                    top_cat = cat_counts.index[0]
+                    top_count = cat_counts.iloc[0]
+                    st.metric("Meest voorkomende categorie", f"{top_cat} ({top_count})")
         
         with stat_col2:
             # Tweede kolom statistieken
@@ -619,6 +660,25 @@ with col2:
                 # Gemiddelde reistijd berekenen
                 gem_reistijd = filtered_data['reistijd_min'].mean()
                 st.metric("Gem. reistijd (min)", round(gem_reistijd, 1))
+
+        # NIEUW: Als voorstel_gebied_cat beschikbaar is, toon een verdeling van de categorieën
+        if 'voorstel_gebied_cat' in filtered_data.columns:
+            st.subheader("Verdeling gebied categorieën")
+            cat_counts = filtered_data['voorstel_gebied_cat'].value_counts().reset_index()
+            cat_counts.columns = ['Categorie', 'Aantal']
+            
+            # Maak een staafdiagram van de categorie verdeling
+            fig = px.bar(
+                cat_counts, 
+                x='Categorie', 
+                y='Aantal',
+                color='Categorie',
+                color_discrete_sequence=monuta_palette,
+                labels={'Categorie': 'Voorstel gebied categorie', 'Aantal': 'Aantal PC4-gebieden'}
+            )
+            
+            fig.update_layout(showlegend=False)
+            st.plotly_chart(fig, use_container_width=True)
         
         # Top 5 PC4-gebieden op basis van marktaandeel
         st.subheader("Top 5 PC4-gebieden (hoogste marktaandeel)")
@@ -635,9 +695,13 @@ with col2:
         valid_data = top_data[top_data['sterfte_2023'] > 0]
         
         # Top 5 hoogste marktaandeel
-        top5 = valid_data.sort_values(by='marktaandeel', ascending=False)[
-            ['PC4', 'gemeente', 'woonplaats', 'marktaandeel', 'sterfte_2023', 'uitvaarten_2023']
-        ].head(5)
+        columns_to_display = ['PC4', 'gemeente', 'woonplaats', 'marktaandeel', 'sterfte_2023', 'uitvaarten_2023']
+        
+        # Voeg voorstel_gebied_cat toe aan de weergave indien beschikbaar
+        if 'voorstel_gebied_cat' in valid_data.columns:
+            columns_to_display.insert(3, 'voorstel_gebied_cat')  # Voeg voorstel_gebied_cat toe na woonplaats
+            
+        top5 = valid_data.sort_values(by='marktaandeel', ascending=False)[columns_to_display].head(5)
         
         # Formatteer marktaandeel als percentage
         top5['marktaandeel'] = top5['marktaandeel'].round(2).astype(str) + '%'
@@ -648,9 +712,7 @@ with col2:
         st.subheader("Laagste 5 PC4-gebieden (laagste marktaandeel)")
         
         # Bottom 5 laagste marktaandeel
-        bottom5 = valid_data.sort_values(by='marktaandeel', ascending=True)[
-            ['PC4', 'gemeente', 'woonplaats', 'marktaandeel', 'sterfte_2023', 'uitvaarten_2023']
-        ].head(5)
+        bottom5 = valid_data.sort_values(by='marktaandeel', ascending=True)[columns_to_display].head(5)
         
         # Formatteer marktaandeel als percentage
         bottom5['marktaandeel'] = bottom5['marktaandeel'].round(2).astype(str) + '%'
